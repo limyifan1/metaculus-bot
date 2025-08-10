@@ -74,6 +74,39 @@ class BaseCaseReport(BaseModel):
     base_case_summary: str = Field(description="A summary of the base case.")
 
 
+class BinaryPredictionValue(BaseModel):
+    reasoning: str = Field(description="The reasoning behind the prediction.")
+    probability: float = Field(
+        description="The probability of the event occurring, between 0.0 and 1.0."
+    )
+
+
+class PredictionOption(BaseModel):
+    option: str = Field(description="The name of the option.")
+    probability: float = Field(
+        description="The probability of this option, between 0.0 and 1.0."
+    )
+
+
+class MultipleChoicePredictionValue(BaseModel):
+    reasoning: str = Field(description="The reasoning behind the prediction.")
+    predictions: list[PredictionOption] = Field(
+        description="A list of predictions for each option."
+    )
+
+
+class PercentileValue(BaseModel):
+    percentile: int = Field(description="The percentile, e.g., 10, 50, 90.")
+    value: float = Field(description="The value at this percentile.")
+
+
+class NumericPredictionValue(BaseModel):
+    reasoning: str = Field(description="The reasoning behind the prediction.")
+    percentiles: list[PercentileValue] = Field(
+        description="A list of percentiles and their corresponding values."
+    )
+
+
 @function_tool
 async def web_search(query: str) -> str:
     """Searches the web for information about a given query."""
@@ -361,119 +394,234 @@ You must be skeptical of the analysis of the base case agent. If you are in doub
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-
         async with self._concurrency_limiter:
-            original_instructions = self.forecaster_agent.instructions
-            try:
-                self.forecaster_agent.instructions += """
-The last thing you write is your final answer as: "Probability: ZZ%", 0.1-99.9
-"""
-                with trace("forecaster_agent"):
-                    logger.info("--- Running Forecaster Agent ---")
-                    logger.info(f"Question: {question.question_text}")
-                    result = await Runner.run(self.forecaster_agent, question.question_text, max_turns=20)
-                    logger.info("--- Agent run completed ---")
-                    if result and hasattr(result, "final_output"):
-                        logger.info("--- Agent's Final Output ---")
-                        logger.info(result.final_output)
-                        reasoning = result.final_output
-                        prediction: float = PredictionExtractor.extract_last_percentage_value(
-                            reasoning, max_prediction=1, min_prediction=0
-                        )
-                        logger.info(
-                            f"Forecasted URL {question.page_url} as {prediction} with reasoning:\n{reasoning}"
-                        )
-                        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
-                    else:
-                        logger.warning(
-                            "No final output received or result format is different."
-                        )
-                        logger.info(f"Full result: {result}")
-                        return ReasonedPrediction(prediction_value=0.5, reasoning="Error in agent execution")
-            finally:
-                self.forecaster_agent.instructions = original_instructions
+            # 1. Run the main forecaster agent to get a detailed analysis.
+            with trace("forecaster_agent"):
+                logger.info("--- Running Forecaster Agent for analysis ---")
+                logger.info(f"Question: {question.question_text}")
+                analysis_result = await Runner.run(
+                    self.forecaster_agent, question.question_text, max_turns=20
+                )
+                logger.info("--- Forecaster Agent analysis completed ---")
+
+            if not (
+                analysis_result
+                and hasattr(analysis_result, "final_output")
+                and analysis_result.final_output
+            ):
+                logger.warning("Forecaster agent did not produce an analysis.")
+                return ReasonedPrediction(
+                    prediction_value=0.5,
+                    reasoning="Error in agent execution: no analysis from forecaster agent.",
+                )
+
+            analysis_text = analysis_result.final_output
+            logger.info("--- Forecaster Agent's Final Analysis ---")
+            logger.info(analysis_text)
+
+            # 2. Create a dedicated agent to extract the final prediction from the analysis.
+            binary_prediction_agent = Agent(
+                name="Binary Prediction Agent",
+                instructions=f"""You are a prediction agent. Your task is to analyze the provided text and output a final probability and a summary of the reasoning.
+The user will provide a detailed analysis of a forecasting question. Your job is to:
+1. Read the entire analysis carefully.
+2. Synthesize the key arguments and evidence into a concise 'reasoning' text. This reasoning should justify the final probability.
+3. Determine the final probability, which must be a single float between 0.0 and 1.0.
+4. Output the reasoning and the probability in the required format.
+""",
+                model=OpenAIChatCompletionsModel(
+                    model="o4-mini", openai_client=MetaculusAsyncOpenAI()
+                ),
+                output_type=AgentOutputSchema(
+                    BinaryPredictionValue, strict_json_schema=True
+                ),
+            )
+
+            # 3. Run the prediction agent.
+            with trace("binary_prediction_agent"):
+                logger.info("--- Running Binary Prediction Agent ---")
+                prediction_result = await Runner.run(
+                    binary_prediction_agent, analysis_text
+                )
+                logger.info("--- Binary Prediction Agent run completed ---")
+
+            if not (prediction_result and hasattr(prediction_result, "final_output")):
+                logger.warning(
+                    "Binary prediction agent did not return a valid prediction."
+                )
+                # Fallback to using the analysis text as reasoning, but log an error.
+                return ReasonedPrediction(
+                    prediction_value=0.5,
+                    reasoning=analysis_text
+                    + "\n\nError: Failed to get structured prediction.",
+                )
+
+            # 4. Construct the final ReasonedPrediction from the Pydantic object.
+            prediction: BinaryPredictionValue = prediction_result.final_output
+
+            logger.info(
+                f"Forecasted URL {question.page_url} as {prediction.probability} with reasoning:\n{prediction.reasoning}"
+            )
+            return ReasonedPrediction(
+                prediction_value=prediction.probability, reasoning=prediction.reasoning
+            )
 
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
         async with self._concurrency_limiter:
-            original_instructions = self.forecaster_agent.instructions
-            try:
-                self.forecaster_agent.instructions += f"""
-The last thing you write is your final probabilities for the N options in this order {question.options} as:
-Option_A: Probability_A
-Option_B: Probability_B
-...
-Option_N: Probability_N
-"""
-                with trace("forecaster_agent"):
-                    logger.info("--- Running Forecaster Agent ---")
-                    logger.info(f"Question: {question.question_text}")
-                    result = await Runner.run(self.forecaster_agent, question.question_text)
-                    logger.info("--- Agent run completed ---")
-                    if result and hasattr(result, "final_output"):
-                        logger.info("--- Agent's Final Output ---")
-                        logger.info(result.final_output)
-                        reasoning = result.final_output
-                        prediction: PredictedOptionList = (
-                            PredictionExtractor.extract_option_list_with_percentage_afterwards(
-                                reasoning, question.options
-                            )
-                        )
-                        logger.info(
-                            f"Forecasted URL {question.page_url} as {prediction} with reasoning:\n{reasoning}"
-                        )
-                        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
-                    else:
-                        logger.warning(
-                            "No final output received or result format is different."
-                        )
-                        logger.info(f"Full result: {result}")
-                        return ReasonedPrediction(prediction_value=[], reasoning="Error in agent execution")
-            finally:
-                self.forecaster_agent.instructions = original_instructions
+            # 1. Run the main forecaster agent to get a detailed analysis.
+            with trace("forecaster_agent"):
+                logger.info("--- Running Forecaster Agent for analysis ---")
+                logger.info(f"Question: {question.question_text}")
+                analysis_result = await Runner.run(
+                    self.forecaster_agent, question.question_text, max_turns=20
+                )
+                logger.info("--- Forecaster Agent analysis completed ---")
+
+            if not (
+                analysis_result
+                and hasattr(analysis_result, "final_output")
+                and analysis_result.final_output
+            ):
+                logger.warning("Forecaster agent did not produce an analysis.")
+                return ReasonedPrediction(
+                    prediction_value=[],
+                    reasoning="Error in agent execution: no analysis from forecaster agent.",
+                )
+
+            analysis_text = analysis_result.final_output
+            logger.info("--- Forecaster Agent's Final Analysis ---")
+            logger.info(analysis_text)
+
+            # 2. Create a dedicated agent to extract the final prediction from the analysis.
+            mcq_prediction_agent = Agent(
+                name="Multiple Choice Prediction Agent",
+                instructions=f"""You are a prediction agent. Your task is to analyze the provided text and output a final probability distribution for a multiple-choice question.
+The user will provide a detailed analysis of a forecasting question with the following options: {question.options}.
+Your job is to:
+1. Read the entire analysis carefully.
+2. Synthesize the key arguments and evidence into a concise 'reasoning' text. This reasoning should justify the final probabilities.
+3. For each option in {question.options}, determine the final probability. The probabilities for all options must sum to 1.0.
+4. Output the reasoning and the list of predictions in the required format. Ensure every option from the question is included in your output.
+""",
+                model=OpenAIChatCompletionsModel(
+                    model="o4-mini", openai_client=MetaculusAsyncOpenAI()
+                ),
+                output_type=AgentOutputSchema(
+                    MultipleChoicePredictionValue, strict_json_schema=True
+                ),
+            )
+
+            # 3. Run the prediction agent.
+            with trace("mcq_prediction_agent"):
+                logger.info("--- Running Multiple Choice Prediction Agent ---")
+                prediction_result = await Runner.run(
+                    mcq_prediction_agent, analysis_text
+                )
+                logger.info("--- Multiple Choice Prediction Agent run completed ---")
+
+            if not (prediction_result and hasattr(prediction_result, "final_output")):
+                logger.warning(
+                    "MCQ prediction agent did not return a valid prediction."
+                )
+                return ReasonedPrediction(
+                    prediction_value=[],
+                    reasoning=analysis_text
+                    + "\n\nError: Failed to get structured prediction.",
+                )
+
+            # 4. Construct the final ReasonedPrediction from the Pydantic object.
+            prediction: MultipleChoicePredictionValue = prediction_result.final_output
+
+            # Convert the Pydantic model output to the PredictedOptionList type
+            predicted_option_list = [
+                {"option": p.option, "probability": p.probability}
+                for p in prediction.predictions
+            ]
+
+            logger.info(
+                f"Forecasted URL {question.page_url} as {predicted_option_list} with reasoning:\n{prediction.reasoning}"
+            )
+            return ReasonedPrediction(
+                prediction_value=predicted_option_list, reasoning=prediction.reasoning
+            )
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
         async with self._concurrency_limiter:
-            original_instructions = self.forecaster_agent.instructions
-            try:
-                self.forecaster_agent.instructions += f"""
-The last thing you write is your final answer as:
-"
-Percentile 10: XX
-Percentile 20: XX
-Percentile 40: XX
-Percentile 60: XX
-Percentile 80: XX
-Percentile 90: XX
-"
-"""
-                with trace("forecaster_agent"):
-                    logger.info("--- Running Forecaster Agent ---")
-                    logger.info(f"Question: {question.question_text}")
-                    result = await Runner.run(self.forecaster_agent, question.question_text)
-                    logger.info("--- Agent run completed ---")
-                    if result and hasattr(result, "final_output"):
-                        logger.info("--- Agent's Final Output ---")
-                        logger.info(result.final_output)
-                        reasoning = result.final_output
-                        prediction: NumericDistribution = (
-                            PredictionExtractor.extract_numeric_distribution_from_list_of_percentile_number_and_probability(
-                                reasoning, question
-                            )
-                        )
-                        logger.info(
-                            f"Forecasted URL {question.page_url} as {prediction.declared_percentiles} with reasoning:\n{reasoning}"
-                        )
-                        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
-                    else:
-                        logger.warning(
-                            "No final output received or result format is different."
-                        )
-                        logger.info(f"Full result: {result}")
-                        return ReasonedPrediction(prediction_value=NumericDistribution([]), reasoning="Error in agent execution")
-            finally:
-                self.forecaster_agent.instructions = original_instructions
+            # 1. Run the main forecaster agent to get a detailed analysis.
+            with trace("forecaster_agent"):
+                logger.info("--- Running Forecaster Agent for analysis ---")
+                logger.info(f"Question: {question.question_text}")
+                analysis_result = await Runner.run(
+                    self.forecaster_agent, question.question_text, max_turns=20
+                )
+                logger.info("--- Forecaster Agent analysis completed ---")
+
+            if not (
+                analysis_result
+                and hasattr(analysis_result, "final_output")
+                and analysis_result.final_output
+            ):
+                logger.warning("Forecaster agent did not produce an analysis.")
+                return ReasonedPrediction(
+                    prediction_value=NumericDistribution([]),
+                    reasoning="Error in agent execution: no analysis from forecaster agent.",
+                )
+
+            analysis_text = analysis_result.final_output
+            logger.info("--- Forecaster Agent's Final Analysis ---")
+            logger.info(analysis_text)
+
+            # 2. Create a dedicated agent to extract the final prediction from the analysis.
+            numeric_prediction_agent = Agent(
+                name="Numeric Prediction Agent",
+                instructions=f"""You are a prediction agent. Your task is to analyze the provided text and output a final numeric distribution.
+The user will provide a detailed analysis of a forecasting question. Your job is to:
+1. Read the entire analysis carefully.
+2. Synthesize the key arguments and evidence into a concise 'reasoning' text. This reasoning should justify the final distribution.
+3. Determine the values for the following percentiles: 10, 20, 40, 60, 80, 90. The values should be monotonically increasing.
+4. Output the reasoning and the list of percentiles and their values in the required format.
+""",
+                model=OpenAIChatCompletionsModel(
+                    model="o4-mini", openai_client=MetaculusAsyncOpenAI()
+                ),
+                output_type=AgentOutputSchema(
+                    NumericPredictionValue, strict_json_schema=True
+                ),
+            )
+
+            # 3. Run the prediction agent.
+            with trace("numeric_prediction_agent"):
+                logger.info("--- Running Numeric Prediction Agent ---")
+                prediction_result = await Runner.run(
+                    numeric_prediction_agent, analysis_text
+                )
+                logger.info("--- Numeric Prediction Agent run completed ---")
+
+            if not (prediction_result and hasattr(prediction_result, "final_output")):
+                logger.warning(
+                    "Numeric prediction agent did not return a valid prediction."
+                )
+                return ReasonedPrediction(
+                    prediction_value=NumericDistribution([]),
+                    reasoning=analysis_text
+                    + "\n\nError: Failed to get structured prediction.",
+                )
+
+            # 4. Construct the final ReasonedPrediction from the Pydantic object.
+            prediction: NumericPredictionValue = prediction_result.final_output
+
+            # Convert the Pydantic model output to the NumericDistribution type
+            percentiles = [(p.percentile, p.value) for p in prediction.percentiles]
+            numeric_distribution = NumericDistribution(percentiles)
+
+            logger.info(
+                f"Forecasted URL {question.page_url} as {numeric_distribution.declared_percentiles} with reasoning:\n{prediction.reasoning}"
+            )
+            return ReasonedPrediction(
+                prediction_value=numeric_distribution, reasoning=prediction.reasoning
+            )

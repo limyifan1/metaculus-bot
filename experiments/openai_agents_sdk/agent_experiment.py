@@ -95,6 +95,7 @@ async def web_search(query: str) -> str:
 
     gemini_api_key_1 = os.environ.get("GEMINI_API_KEY_1")
     gemini_api_key_2 = os.environ.get("GEMINI_API_KEY_2")
+    gemini_api_key_3 = os.environ.get("GEMINI_API_KEY_3")
 
     # Try Gemini with the first key
     if gemini_api_key_1:
@@ -121,6 +122,20 @@ async def web_search(query: str) -> str:
             return response
         except Exception as e:
             logger.warning(f"Gemini search with key 2 failed: {e}")
+    
+    # Try Gemini with the third key
+    if gemini_api_key_3:
+        try:
+            logger.info("Trying web search with Gemini API Key 3...")
+            response = await asyncio.to_thread(
+                gemini_web_search, query, gemini_api_key_3
+            )
+            logger.info(f"🔍 Search result: {response}")
+            logger.info("--- END WEB SEARCH ---")
+            return response
+        except Exception as e:
+            logger.warning(f"Gemini search with key 3 failed: {e}")
+
 
     # Fallback to the original implementation
     logger.info("Falling back to GeneralLlm for web search.")
@@ -373,7 +388,7 @@ async def run_agent_experiment():
     try:
         with trace("forecaster_agent"):
             logger.info("--- Running Forecaster Agent ---")
-            question = "Will Sudan ratify AfCFTA (the pan-African free trade agreement) before July 1, 2025? Yes or No?"
+            question = "Will Shigeru Ishiba cease to be Prime Minister of Japan before September 2025?"
             logger.info(f"Question: {question}")
             # OpenAI Agents SDK "Hello world" example
             result = await Runner.run(forecaster_agent, question)

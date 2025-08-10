@@ -371,7 +371,7 @@ The last thing you write is your final answer as: "Probability: ZZ%", 0.1-99.9
                 with trace("forecaster_agent"):
                     logger.info("--- Running Forecaster Agent ---")
                     logger.info(f"Question: {question.question_text}")
-                    result = await Runner.run(self.forecaster_agent, question.question_text)
+                    result = await Runner.run(self.forecaster_agent, question.question_text, max_turns=20)
                     logger.info("--- Agent run completed ---")
                     if result and hasattr(result, "final_output"):
                         logger.info("--- Agent's Final Output ---")

@@ -3,6 +3,8 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Literal
+from gemini_api import gemini_web_search
+import os
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -109,6 +111,11 @@ class FallTemplateBot2025(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             research = ""
+
+            gemini_api_key_1 = os.environ.get("GEMINI_API_KEY_1")
+            gemini_api_key_2 = os.environ.get("GEMINI_API_KEY_2")
+            gemini_api_key_3 = os.environ.get("GEMINI_API_KEY_3")
+
             researcher = self.get_llm("researcher")
 
             prompt = clean_indents(
@@ -128,36 +135,44 @@ class FallTemplateBot2025(ForecastBot):
                 """
             )
 
+            # Try Gemini with the first key
+            if gemini_api_key_1:
+                try:
+                    print("Trying web search with Gemini API Key 1...")
+                    response = await asyncio.to_thread(
+                        gemini_web_search, prompt, gemini_api_key_1
+                    )
+                    print(f"\n🔍 Search result: {response}")
+                    return response
+                except Exception as e:
+                    print(f"Gemini search with key 1 failed: {e}")
+
+            # Try Gemini with the second key
+            if gemini_api_key_2:
+                try:
+                    print("Trying web search with Gemini API Key 2...")
+                    response = await asyncio.to_thread(
+                        gemini_web_search, prompt, gemini_api_key_2
+                    )
+                    print(f"\n🔍 Search result: {response}")
+                    return response
+                except Exception as e:
+                    print(f"Gemini search with key 2 failed: {e}")
+
+            if gemini_api_key_3:
+                try:
+                    print("Trying web search with Gemini API Key 3...")
+                    response = await asyncio.to_thread(
+                        gemini_web_search, prompt, gemini_api_key_3
+                    )
+                    print(f"\n🔍 Search result: {response}")
+                    return response
+                except Exception as e:
+                    print(f"Gemini search with key 3 failed: {e}")
+            # Fallback to the original implementation
+            print("Falling back to GeneralLlm for web search.")
             if isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(prompt)
-            elif researcher == "asknews/news-summaries":
-                research = await AskNewsSearcher().get_formatted_news_async(
-                    question.question_text
-                )
-            elif researcher == "asknews/deep-research/medium-depth":
-                research = await AskNewsSearcher().get_formatted_deep_research(
-                    question.question_text,
-                    sources=["asknews", "google"],
-                    search_depth=2,
-                    max_depth=4,
-                )
-            elif researcher == "asknews/deep-research/high-depth":
-                research = await AskNewsSearcher().get_formatted_deep_research(
-                    question.question_text,
-                    sources=["asknews", "google"],
-                    search_depth=4,
-                    max_depth=6,
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
             elif not researcher or researcher == "None":
                 research = ""
             else:

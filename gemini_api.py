@@ -24,7 +24,7 @@ def gemini_web_search(query: str, api_key: str) -> str:
     try:
         client = genai.Client(api_key=api_key)
 
-        model = "gemini-2.5-flash-preview-05-20"
+        model = "gemini-2.5-flash"
         contents = [
             types.Content(
                 role="user",

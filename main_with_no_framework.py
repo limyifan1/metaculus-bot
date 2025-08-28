@@ -3,6 +3,9 @@ import datetime
 import json
 import os
 import re
+import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 
 import dotenv
 
@@ -340,8 +343,163 @@ def call_asknews(question: str) -> str:
         client_id=ASKNEWS_CLIENT_ID, client_secret=ASKNEWS_SECRET, scopes=set(["news"])
     )
 
+    def _extract_status_and_retry_after(ex: Exception) -> tuple[int | None, int | None]:
+        """Best-effort extraction of status and retry-after seconds.
+
+        Tries common headers: Retry-After, RateLimit-Reset, X-RateLimit-Reset,
+        and also attempts to parse HTTP-date values. Falls back to None.
+        """
+        status_code = None
+        retry_after_seconds = None
+        resp = getattr(ex, "response", None)
+        if resp is not None:
+            status_code = getattr(resp, "status_code", None)
+            headers = getattr(resp, "headers", {}) or {}
+
+            # Case-insensitive getter helper
+            def _hget(h: str):
+                try:
+                    return headers.get(h) or headers.get(h.lower()) or headers.get(h.title())
+                except Exception:
+                    return None
+
+            # 1) Standard Retry-After header (seconds or HTTP-date)
+            retry_after_val = _hget("Retry-After")
+
+            # 2) RFC RateLimit-Reset: seconds until reset
+            if not retry_after_val:
+                retry_after_val = _hget("RateLimit-Reset")
+
+            # 3) Common vendor headers: X-RateLimit-Reset (epoch seconds or ms)
+            xrate_reset = _hget("X-RateLimit-Reset") or _hget("X-Rate-Limit-Reset")
+
+            # 4) Sometimes providers expose exact reset time
+            reset_at = _hget("X-RateLimit-Reset-At") or _hget("RateLimit-Reset-At")
+
+            # Parse Retry-After / RateLimit-Reset if present
+            if retry_after_val:
+                s = str(retry_after_val).strip()
+                try:
+                    # Numeric seconds delta
+                    retry_after_seconds = int(s)
+                except ValueError:
+                    # HTTP-date
+                    try:
+                        dt = parsedate_to_datetime(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        retry_after_seconds = max(
+                            0, int((dt - datetime.datetime.now(timezone.utc)).total_seconds())
+                        )
+                    except Exception:
+                        retry_after_seconds = None
+
+            # If still None, try X-RateLimit-Reset epoch parsing
+            if retry_after_seconds is None and xrate_reset:
+                try:
+                    s = str(xrate_reset).strip()
+                    ts = int(float(s))
+                    # Heuristic: treat very large values as ms
+                    if ts > 10_000_000_000:
+                        ts = ts // 1000
+                    now = int(datetime.datetime.now(timezone.utc).timestamp())
+                    retry_after_seconds = max(0, ts - now)
+                except Exception:
+                    pass
+
+            # If still None, try reset-at as datetime string
+            if retry_after_seconds is None and reset_at:
+                try:
+                    dt = parsedate_to_datetime(str(reset_at))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    retry_after_seconds = max(
+                        0, int((dt - datetime.datetime.now(timezone.utc)).total_seconds())
+                    )
+                except Exception:
+                    pass
+
+            # As a last resort, attempt to parse seconds from a JSON body message
+            if retry_after_seconds is None:
+                try:
+                    body = getattr(resp, "text", None)
+                    if body and isinstance(body, str):
+                        import json, re
+
+                        retry_after_seconds = None
+                        try:
+                            j = json.loads(body)
+                        except Exception:
+                            j = None
+                        if isinstance(j, dict):
+                            for k in (
+                                "retry_after",
+                                "retry-after",
+                                "reset",
+                                "reset_seconds",
+                                "reset_after",
+                            ):
+                                if k in j:
+                                    try:
+                                        retry_after_seconds = int(float(str(j[k])))
+                                        break
+                                    except Exception:
+                                        pass
+                            if retry_after_seconds is None and isinstance(j.get("detail"), str):
+                                m = re.search(r"(?i)try again in\s+(\d+)\s*sec", j["detail"])
+                                if m:
+                                    retry_after_seconds = int(m.group(1))
+                    # If not JSON, try regex on plain text
+                    if retry_after_seconds is None and body:
+                        import re as _re
+
+                        m2 = _re.search(r"(?i)retry-?after\s*:\s*(\d+)", body)
+                        if m2:
+                            retry_after_seconds = int(m2.group(1))
+                except Exception:
+                    pass
+
+        if status_code is None:
+            status_code = getattr(ex, "status_code", None)
+        return status_code, retry_after_seconds
+
+    def _retry_asknews_search(**kwargs):
+        max_retries = 3
+        last_err: Exception | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                return ask.news.search_news(**kwargs)
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                status, retry_after = _extract_status_and_retry_after(e)
+                is_rate_limit = False
+                if status == 429:
+                    is_rate_limit = True
+                else:
+                    name = e.__class__.__name__
+                    msg = str(e)
+                    if "RateLimit" in name or "429" in msg or "Rate Limit Exceeded" in msg:
+                        is_rate_limit = True
+
+                if not is_rate_limit or attempt == max_retries:
+                    print(f"AskNews search failed (attempt {attempt}/{max_retries}). Error: {e}")
+                    if attempt == max_retries:
+                        raise
+                    wait_s = 5
+                    print(f"Retrying AskNews in {wait_s}s (transient error)")
+                    time.sleep(wait_s)
+                    continue
+
+                wait_seconds = retry_after if (retry_after is not None and retry_after >= 0) else 60
+                print(
+                    f"AskNews rate limited (429). Retry-After: {retry_after if retry_after is not None else 'N/A'}; waiting {wait_seconds}s before retry {attempt+1}/{max_retries}"
+                )
+                time.sleep(wait_seconds)
+        # Should not reach here, but raise last error if so
+        raise last_err if last_err else RuntimeError("Unknown AskNews error")
+
     # get the latest news related to the query (within the past 48 hours)
-    hot_response = ask.news.search_news(
+    hot_response = _retry_asknews_search(
         query=question,  # your natural language query
         n_articles=6,  # control the number of articles to include in the context, originally 5
         return_type="both",
@@ -349,7 +507,7 @@ def call_asknews(question: str) -> str:
     )
 
     # get context from the "historical" database that contains a news archive going back to 2023
-    historical_response = ask.news.search_news(
+    historical_response = _retry_asknews_search(
         query=question,
         n_articles=10,
         return_type="both",

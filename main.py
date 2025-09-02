@@ -49,13 +49,9 @@ if __name__ == "__main__":
                 allowed_tries=2,
             ),
             "summarizer": "openai/gpt-4.1-nano",
-            # "researcher": GeneralLlm(
-            #     model="openrouter/gpt-4o-search-preview",
-            #     temperature=None,
-            #     timeout=40,
-            #     allowed_tries=2,
-            # ),
-            "researcher": "asknews/news-summaries",
+            # Research is now multi-source (AskNews + GPT-4o Search + Gemini)
+            # implemented in fall_template_bot_2025/research.py, so no
+            # dedicated "researcher" model is configured here.
         },
     )
 

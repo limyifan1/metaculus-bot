@@ -4,11 +4,95 @@ import os
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
-from forecasting_tools import AskNewsSearcher, GeneralLlm, MetaculusQuestion
+from forecasting_tools import GeneralLlm, MetaculusQuestion
+from asknews_sdk import AsyncAskNewsSDK
 from gemini_api import gemini_web_search
 
 logger = logging.getLogger(__name__)
 
+
+async def _asknews_single_search_formatted(query: str) -> str:
+    """Call AskNews once and return formatted articles.
+
+    Strategy and n_articles are configurable via env vars:
+    - ASKNEWS_STRATEGY: one of AskNews strategies (default: "news knowledge")
+    - ASKNEWS_N_ARTICLES: integer count (default: 10)
+    """
+    client_id = os.getenv("ASKNEWS_CLIENT_ID")
+    client_secret = os.getenv("ASKNEWS_SECRET")
+    if not client_id or not client_secret:
+        raise ValueError("ASKNEWS_CLIENT_ID or ASKNEWS_SECRET is not set")
+
+    strategy = os.getenv("ASKNEWS_STRATEGY", "news knowledge")
+    try:
+        n_articles = int(os.getenv("ASKNEWS_N_ARTICLES", "10"))
+    except Exception:
+        n_articles = 10
+
+    async with AsyncAskNewsSDK(
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes={"news"},
+    ) as ask:
+        response = await ask.news.search_news(
+            query=query,
+            n_articles=n_articles,
+            return_type="both",
+            strategy=strategy,
+        )
+
+    articles = getattr(response, "as_dicts", None)
+    formatted = "Here are the relevant news articles:\n\n"
+    if articles:
+        formatted += _format_articles(articles)
+    else:
+        formatted += "No articles were found.\n\n"
+    return formatted
+
+
+def _format_articles(articles) -> str:
+    try:
+        sorted_articles = sorted(articles, key=lambda x: x.pub_date, reverse=True)
+    except Exception:
+        # Fallback if objects are dict-like
+        try:
+            sorted_articles = sorted(
+                articles,
+                key=lambda x: x.get("pub_date"),
+                reverse=True,
+            )
+        except Exception:
+            sorted_articles = articles
+
+    out = ""
+    for article in sorted_articles:
+        try:
+            eng_title = getattr(article, "eng_title", None) or article.get("eng_title", "")
+            summary = getattr(article, "summary", None) or article.get("summary", "")
+            language = getattr(article, "language", None) or article.get("language", "")
+            source_id = getattr(article, "source_id", None) or article.get("source_id", "")
+            article_url = getattr(article, "article_url", None) or article.get("article_url", "")
+            pub_date = getattr(article, "pub_date", None) or article.get("pub_date")
+            if hasattr(pub_date, "strftime"):
+                pub_date_str = pub_date.strftime("%B %d, %Y %I:%M %p")
+            else:
+                pub_date_str = str(pub_date) if pub_date is not None else ""
+        except Exception:
+            # If structure surprises us, best-effort stringify
+            eng_title = str(article)
+            summary = ""
+            language = ""
+            source_id = ""
+            article_url = ""
+            pub_date_str = ""
+
+        out += (
+            f"**{eng_title}**\n{summary}\n"
+            f"Original language: {language}\n"
+            f"Publish date: {pub_date_str}\n"
+            f"Source:[{source_id}]({article_url})\n\n"
+        )
+    return out
 
 async def run_research(self, question: MetaculusQuestion) -> str:  # noqa: ANN001
     async with self._concurrency_limiter:  # type: ignore[attr-defined]
@@ -52,12 +136,12 @@ async def run_research(self, question: MetaculusQuestion) -> str:  # noqa: ANN00
             for attempt in range(1, max_retries + 1):
                 try:
                     logger.info(
-                        "Calling AskNews.get_formatted_news_async (attempt %s/%s) for URL %s",
+                        "Calling AskNews (single-search) (attempt %s/%s) for URL %s",
                         attempt,
                         max_retries,
                         getattr(question, "page_url", "<unknown>"),
                     )
-                    research = await AskNewsSearcher().get_formatted_news_async(
+                    research = await _asknews_single_search_formatted(
                         question.question_text
                     )
                     # Log what AskNews returned (summary + preview)

@@ -1,8 +1,6 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 
 from forecasting_tools import GeneralLlm, MetaculusQuestion
 from asknews_sdk import AsyncAskNewsSDK
@@ -95,16 +93,17 @@ def _format_articles(articles) -> str:
     return out
 
 async def run_research(self, question: MetaculusQuestion) -> str:  # noqa: ANN001
+    """Run multi-source research and combine into one report.
+
+    Attempts all of the following in parallel:
+    - AskNews news summaries
+    - OpenRouter `openrouter/gpt-4o-search-preview`
+    - Gemini web search (tries GEMINI_API_KEY_1..3)
+
+    If any fails, we log and ignore it, returning a combined report from
+    whatever succeeded. Never raises.
+    """
     async with self._concurrency_limiter:  # type: ignore[attr-defined]
-        research = ""
-        research_source = "unknown"
-
-        gemini_api_key_1 = os.environ.get("GEMINI_API_KEY_1")
-        gemini_api_key_2 = os.environ.get("GEMINI_API_KEY_2")
-        gemini_api_key_3 = os.environ.get("GEMINI_API_KEY_3")
-
-        researcher = self.get_llm("researcher")
-
         from forecasting_tools import clean_indents
         from .prompts import research_prompt
 
@@ -115,7 +114,6 @@ async def run_research(self, question: MetaculusQuestion) -> str:  # noqa: ANN00
                 question.fine_print,
             )
         )
-
         if isinstance(researcher, GeneralLlm):
             research_source = "general-llm"
             research = await researcher.invoke(prompt)
@@ -379,41 +377,112 @@ async def run_research(self, question: MetaculusQuestion) -> str:  # noqa: ANN00
                     gemini_success = True
                 except Exception as e:
                     logger.warning(f"Gemini search with key 1 failed: {e}")
+        # Define individual fetchers with internal error handling.
+        async def fetch_asknews() -> str | None:
+            try:
+                logger.info(
+                    "AskNews: fetching for URL %s | query preview: %s",
+                    getattr(question, "page_url", "<unknown>"),
+                    (
+                        (question.question_text[:200] + "…")
+                        if len(question.question_text) > 200
+                        else question.question_text
+                    ),
+                )
+                text = await AskNewsSearcher().get_formatted_news_async(
+                    question.question_text
+                )
+                logger.info(
+                    "AskNews: got %s chars",
+                    len(text) if isinstance(text, str) else 0,
+                )
+                return text
+            except Exception as e:  # noqa: BLE001
+                logger.warning("AskNews failed: %s", e)
+                return None
 
-            if gemini_api_key_2 and not gemini_success:
-                try:
-                    logger.info("Trying web search with Gemini API Key 2...")
-                    response = await asyncio.to_thread(
-                        gemini_web_search, prompt, gemini_api_key_2
-                    )
-                    logger.info(f"Search result: {response}")
-                    research = response
-                    research_source = "gemini"
-                    gemini_success = True
-                except Exception as e:
-                    logger.warning(f"Gemini search with key 2 failed: {e}")
+        async def fetch_gpt4o() -> str | None:
+            try:
+                # Use explicit model to ensure search-capable variant is used.
+                gpt4o = GeneralLlm(
+                    model="openrouter/gpt-4o-search-preview",
+                    temperature=None,
+                    timeout=60,
+                    allowed_tries=2,
+                )
+                logger.info("GPT-4o Search: invoking model for research")
+                text = await gpt4o.invoke(prompt)
+                logger.info(
+                    "GPT-4o Search: got %s chars",
+                    len(text) if isinstance(text, str) else 0,
+                )
+                return text
+            except Exception as e:  # noqa: BLE001
+                logger.warning("GPT-4o Search failed: %s", e)
+                return None
 
-            if gemini_api_key_3 and not gemini_success:
+        async def fetch_gemini() -> str | None:
+            # Try keys in order; run in thread because client is sync.
+            for idx, key in enumerate(
+                [gemini_api_key_1, gemini_api_key_2, gemini_api_key_3], start=1
+            ):
+                if not key:
+                    continue
                 try:
-                    logger.info("Trying web search with Gemini API Key 3...")
-                    response = await asyncio.to_thread(
-                        gemini_web_search, prompt, gemini_api_key_3
+                    logger.info("Gemini: trying API key %s", idx)
+                    text = await asyncio.to_thread(gemini_web_search, prompt, key)
+                    logger.info(
+                        "Gemini: got %s chars",
+                        len(text) if isinstance(text, str) else 0,
                     )
-                    logger.info(f"Search result: {response}")
-                    research = response
-                    research_source = "gemini"
-                    gemini_success = True
-                except Exception as e:
-                    logger.warning(f"Gemini search with key 3 failed: {e}")
-        elif not researcher or researcher == "None":
-            research = ""
-            research_source = "none"
-        else:
-            llm = self.get_llm("researcher", "llm")
-            research = await llm.invoke(prompt)
-            research_source = "llm"
+                    return text
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Gemini with key %s failed: %s", idx, e)
+                    continue
+            return None
+
+        # Launch all three in parallel and gather results.
+        asknews_task = asyncio.create_task(fetch_asknews())
+        gpt4o_task = asyncio.create_task(fetch_gpt4o())
+        gemini_task = asyncio.create_task(fetch_gemini())
+
+        results = await asyncio.gather(asknews_task, gpt4o_task, gemini_task)
+        asknews_res, gpt4o_res, gemini_res = results
+
+        sources_included: list[str] = []
+        parts: list[str] = []
+        if asknews_res:
+            sources_included.append("AskNews")
+            parts.append(
+                "AskNews Summary\n----------------\n" + asknews_res.strip()
+            )
+        if gpt4o_res:
+            sources_included.append("GPT-4o Search Preview")
+            parts.append(
+                "OpenRouter GPT-4o Search Preview\n-----------------------------------\n"
+                + gpt4o_res.strip()
+            )
+        if gemini_res:
+            sources_included.append("Gemini Search")
+            parts.append("Gemini Search\n-------------\n" + gemini_res.strip())
+
+        # Combine into one integrated report. If nothing succeeded, return empty string.
+        if not parts:
+            logger.warning(
+                "Research: all sources failed for URL %s; proceeding without research",
+                getattr(question, "page_url", "<unknown>"),
+            )
+            return ""
+
+        combined = (
+            "Integrated Research Report\n============================\n\n"
+            + "\n\n\n".join(parts)
+        )
 
         logger.info(
-            f"Found Research for URL {question.page_url} | source={research_source}:\n{research}"
+            "Found research for URL %s | sources=%s",
+            getattr(question, "page_url", "<unknown>"),
+            ", ".join(sources_included) if sources_included else "none",
         )
-        return research
+        return combined
+

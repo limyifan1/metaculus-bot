@@ -4,34 +4,33 @@
 *   **1.1 High-Level Overview:** This document outlines the technical architecture of a sophisticated probabilistic forecasting system designed to compete in Metaculus tournaments. The system employs a multi-agent, multi-step reasoning process to analyze forecasting questions, conduct comprehensive research, and generate statistically aggregated predictions. It is architected to handle binary, multiple-choice, and numeric question types through specialized, asynchronous workflows, leveraging a heterogeneous "committee" of Large Language Models (LLMs) to produce robust and well-calibrated forecasts.
 
 *   **1.2 Core Design Philosophy:** The system is built upon several key principles to maximize forecasting accuracy and robustness:
-    *   **Multi-Agent Systems:** Instead of relying on a single model, the system uses a "committee" of five distinct LLM agents. This approach introduces cognitive diversity and reduces the risk of idiosyncratic errors or biases from a single model.
-    *   **Ensemble Methods:** Individual forecasts from each agent are not treated equally. They are combined using a weighted average, a classic ensemble technique that leverages the strengths of different models to produce a more accurate and stable final prediction.
-    *   **Prompt Chaining:** The forecasting process is not monolithic but is broken down into a sequence of distinct, interconnected phases guided by prompt chaining. Each phase's output serves as the input for the next, creating a structured cognitive workflow that guides the LLMs from broad research to a final, synthesized prediction.
-    *   **Up-to-Date Research:** The system's reasoning is grounded in current information gathered via AskNews and Gemini 2.5 Flash with the `google_search` tool. It does not perform general web content extraction or agentic browsing.
-    *   **Cognitive Diversity:** The use of different model families (Anthropic's Claude Sonnet 4 via OpenRouter, OpenAI's GPT-5 via OpenRouter, and Google's Gemini 2.5 Pro) is a deliberate strategy to ensure a variety of reasoning patterns and "world models" are applied to each question.
-    *   **Iterative Refinement & Simulated Debate:** The system employs a multi-step forecasting process where initial analyses are generated and then "cross-examined." The reasoning of one agent is passed as context to a different agent in a subsequent step, simulating a peer-review or debate process that refines and challenges initial conclusions before a final forecast is made.
+    *   **Multi-Agent Systems:** Instead of relying on a single model, the system uses a "committee" of LLM agents. By default, three real models are used, and the set is configurable via environment variables. This approach introduces cognitive diversity and reduces the risk of idiosyncratic errors or biases from a single model.
+    *   **Ensemble Methods:** Individual forecasts from each agent are combined using a weighted average (equal weights by default), a classic ensemble technique that leverages the strengths of different models to produce a more accurate and stable final prediction.
+    *   **Prompt Chaining:** The forecasting process is broken down into a sequence of distinct, interconnected phases. Each phase's output serves as the input for the next, creating a structured workflow that guides the LLMs from scoped research to a final, synthesized prediction.
+    *   **Up-to-Date Research:** The system's reasoning is grounded in current information gathered via AskNews and Gemini 2.5 Flash with the `google_search` tool, with an optional GPT‑4o Search (preview) integration via OpenRouter when configured. It does not perform general web content extraction or agentic browsing loops.
+    *   **Cognitive Diversity:** The default committee mixes multiple model families and variants (e.g., Anthropic via OpenRouter and OpenAI via OpenRouter). Additional models can be added via configuration to further increase heterogeneity.
+    *   **Iterative Refinement & Simulated Debate:** The system employs a multi-step forecasting process where initial analyses are generated and then "cross-examined." The reasoning of one agent is passed as context to a different agent in a subsequent step, simulating a peer-review process that refines and challenges initial conclusions before a final forecast is made.
 
 ## 2.0 System Architecture & End-to-End Workflow
-*   **2.1 Question Ingestion & Initialization:** The process originates in `Bot/main.py`. The `get_open_question_ids_from_tournament` function makes an API call to Metaculus, using a predefined `TOURNAMENT_ID` to fetch a list of all open questions. The main execution block then iterates through this list, initiating the `forecast_individual_question` asynchronous task for each question. This function checks if a forecast has already been made (`forecast_is_already_made`) and, if not, proceeds to call the appropriate forecasting orchestrator.
+*   **2.1 Question Ingestion & Initialization:** The process originates in `main.py` (repository root). You can select the engine via a CLI flag: the FallTemplateBot2025 reference engine (`--engine template`) or the committee engine (`--engine committee`). When using the committee engine, `CommitteeForecastBot` (`bot/adapter.py`) integrates with the `forecasting_tools` library to fetch open questions from Metaculus tournaments, orchestrate per-type forecasting calls, and post predictions and comments. Forecast reuse (e.g., skipping previously forecasted questions) is handled by `forecasting_tools` configuration.
 
-*   **2.2 Forecasting Orchestration (Per Question Type):** The script `Bot/forecaster.py` acts as the central router, delegating tasks to specialized modules based on the question type retrieved from the question's metadata. The `forecast_individual_question` function in `Bot/main.py` checks the `question_type` field and calls the corresponding high-level async function (e.g., `binary_forecast`, `multiple_choice_forecast`, `numeric_forecast`) defined in `Bot/forecaster.py`, which in turn call the detailed implementations in their respective modules.
+*   **2.2 Forecasting Orchestration (Per Question Type):** The `CommitteeForecastBot` delegates to specialized modules in `bot/` based on question type. For binary, multiple choice, and numeric questions, it calls `bot/binary.py`, `bot/multiple_choice.py`, and `bot/numeric.py` respectively. These modules perform their own integrated research and multi-agent prompting for each question.
 
-    *   **2.2.1 Binary Question Workflow:** The end-to-end logic is implemented in `Bot/binary.py` within the `get_binary_forecast` function.
-        1.  **Initial Research Scoping:** Two initial prompts, `BINARY_PROMPT_historical` and `BINARY_PROMPT_current`, are formatted with the question details and sent concurrently to generate targeted search directions.
-        2.  **Integrated Research (AskNews + Gemini Search):** The scoped queries inform calls to AskNews and to Gemini 2.5 Flash with the `google_search` tool; their summarized results are carried directly into the next step. No web scraping, Google/Google News direct APIs, or agentic search loops are used.
-        3.  **Initial Forecast Generation:** The integrated research context is used to format `BINARY_PROMPT_1`. This prompt is run concurrently across the multi-model committee to generate an "outside view" prediction.
-        4.  **Simulated Peer Review:** The outputs from the first forecast are strategically rearranged. A `context_map` is created where the analysis from one agent is combined with the integrated research context and passed to a *different* agent for the next phase.
-        5.  **Final Forecast Synthesis:** `BINARY_PROMPT_2` is formatted with this combined peer-review context and run across all agents.
-        6.  **Aggregation:** The final probability from each agent's output is extracted using `extract_probability_from_response_as_percentage_not_decimal`. These probabilities are combined using a weighted average, and the result is clamped to the range [0.001, 0.999].
+    *   **2.2.1 Binary Question Workflow:** The end-to-end logic is implemented in `bot/binary.py` within the `get_binary_forecast` function.
+        1.  **Initial Research Scoping:** Two concise scoping prompts are generated in-line: "Historical perspective on: {question}" and "Current events for: {question}". These are sent (by the scope agent) to produce targeted search directions.
+        2.  **Integrated Research (AskNews + Gemini + optional GPT‑4o Search):** The scoped queries inform a single combined AskNews request (grouping all queries with OR) to use the API sparingly, plus per‑query calls to Gemini 2.5 Flash with the `google_search` tool; when configured, an additional per‑query GPT‑4o Search (preview) section is added via OpenRouter. No web scraping, Google/Google News direct APIs, or agentic search loops are used. Results are summarized and carried into the next step.
+        3.  **Initial Forecast Generation:** The integrated research context is included in a structured prompt and run concurrently across the multi-model committee to generate initial predictions.
+        4.  **Simulated Peer Review:** The outputs from the first forecast are rotated; for each agent, a different agent’s initial analysis is included as "peer analysis", simulating peer review.
+        5.  **Final Forecast Synthesis:** The final prompts include both the research context and the peer analysis; all agents produce refined forecasts.
+        6.  **Aggregation:** The final probability from each agent's output is extracted using `extract_probability_from_response_as_percentage_not_decimal`. These probabilities are combined using a weighted average (equal weights by default), and the result is clamped to the range [0.001, 0.999].
 
-    *   **2.2.2 Multiple-Choice Question Workflow:** This flow, detailed in `Bot/multiple_choice.py`'s `get_multiple_choice_forecast` function, mirrors the binary workflow's structure but uses multiple-choice specific prompts (`MULTIPLE_CHOICE_PROMPT_historical`, `_current`, `_1`, `_2`).
-        1.  It follows the same dual-perspective research scoping and integrated research process (AskNews + Gemini 2.5 Flash `google_search`), without a standalone RAG phase.
-        2.  The initial and final forecasts generate probability distributions across the available options.
-        3.  The function `extract_option_probabilities_from_response` is used to parse the list of probabilities from the LLM's structured output.
-        4.  These probability lists are normalized (`normalize_probabilities`) to ensure they sum to 1.0.
-        5.  The final aggregation computes a weighted average for each option's probability across all agents.
+    *   **2.2.2 Multiple-Choice Question Workflow:** Implemented in `bot/multiple_choice.py:get_multiple_choice_forecast`, this mirrors the binary structure with MC-specific extraction.
+        1.  It follows the same dual-perspective research scoping and integrated research process (AskNews + Gemini, optional GPT‑4o Search), without a standalone RAG phase.
+        2.  The initial and final forecasts generate probability vectors across the available options.
+        3.  `extract_option_probabilities_from_response` parses the probabilities from each agent’s structured output, and `normalize_probabilities` ensures each list sums to 1.0.
+        4.  A weighted average across agents yields the final per-option probabilities.
 
-    *   **2.2.3 Numeric Question Workflow:** Implemented in `Bot/numeric.py`, this workflow also follows the established multi-phase pattern with numeric-specific prompts.
+    *   **2.2.3 Numeric Question Workflow:** Implemented in `bot/numeric.py`, this workflow also follows the established multi-phase pattern with numeric-specific prompts.
         1.  The research and initial analysis phases are analogous to the other types.
         2.  The key difference is the output format. The LLMs are prompted to produce a series of discrete percentile points (e.g., 10th, 25th, 50th, 75th, 90th).
         3.  The `extract_percentiles_from_response` function parses these key-value pairs from the text.
@@ -39,43 +38,47 @@
         5.  The final CDFs from all agents are aggregated using a weighted average.
 
 *   **2.3 The Multi-Agent "Committee" Model:**
-    *   **2.3.1 Agent Composition:** The forecasting committee mixes the following models:
-        *   `openrouter/claude-sonnet-4` via GeneralLLM
-        *   `openrouter/gpt-5` via GeneralLLM
-        *   `gemini-2.5-pro` via `genai.Client`
+    *   **2.3.1 Agent Composition (Default):** By default, the committee uses three real models via OpenRouter:
+        *   `openrouter/anthropic/claude-sonnet-4`
+        *   `openrouter/openai/gpt-5`
+        *   `openrouter/anthropic/claude-opus-4.1`
+        These can be overridden by setting `COMMITTEE_LLM_MODELS` to a comma-separated list of model identifiers. Additional tuning env vars include `COMMITTEE_LLM_TEMPERATURE`, `COMMITTEE_LLM_TIMEOUT`, and `COMMITTEE_LLM_TRIES`.
+        Note: Gemini 2.5 is used in the research stack by default, not as a forecasting agent, but can be added via configuration if desired.
 
-    *   **2.3.2 Rationale for Heterogeneity:** Using a mix of Anthropic (Claude Sonnet 4), OpenAI via OpenRouter (GPT-5), and Google (Gemini 2.5 Pro) is a deliberate design choice. This heterogeneity introduces cognitive diversity, helping to mitigate against the inherent biases or systematic reasoning flaws of any single model architecture and producing a more robust and balanced ensemble.
+    *   **2.3.2 Rationale for Heterogeneity:** Mixing model families (e.g., Anthropic variants and OpenAI via OpenRouter) introduces cognitive diversity, helping to mitigate systematic reasoning flaws of any single model architecture. Teams can expand diversity further by adding additional providers/models via configuration.
 
-    *   **2.3.3 Agent Weighting:** Forecasts are aggregated with configurable weights. A simple starting point is equal weighting across agents, with the option to tune weights empirically based on validation.
+    *   **2.3.3 Agent Weighting:** Forecasts are aggregated with configurable weights (`LLMAgent.weight`). The default is equal weighting across agents, with the option to tune weights empirically.
 
 *   **2.4 The Multi-Step Reasoning Process (Prompt Chaining):**
-    *   **2.4.1 Phase 1: Dual-Perspective Scoping & Research Direction:** The process begins with two parallel prompts, for example `BINARY_PROMPT_historical` and `BINARY_PROMPT_current`. Their explicit goal is not to forecast but to scope the problem from two distinct viewpoints. The `_historical` prompt frames the problem from an "outside view," asking for historical precedents and base rates. The `_current` prompt takes an "inside view," focusing on recent events and key actors. The output of this phase is a structured list of targeted search queries for the next phase.
+    *   **2.4.1 Phase 1: Dual-Perspective Scoping & Research Direction:** The process begins with two parallel prompts: a historical/outside-view framing and a current/inside-view framing (constructed inline as described in 2.2.1). Their goal is to scope targeted queries for research.
 
     *   **2.4.2 Phase 2: Integrated Research (No RAG):**
         *   **AskNews:** Retrieve relevant, structured news context with the AskNews SDK based on the scoped queries.
-        *   **Gemini Search Tool:** Use Gemini 2.5 Flash with the `google_search` tool to surface recent, high-signal sources. No Google/Google News direct API usage, no agentic search loops, and no web content extraction (e.g., headless browsers or HTML scraping) are performed.
+        *   **Gemini Search Tool:** Use Gemini 2.5 Flash with the `google_search` tool to surface recent, high-signal sources.
+        *   **Optional GPT‑4o Search (preview):** When configured, add a third research section via OpenRouter.
+        *   No Google/Google News direct API usage, no agentic search loops, and no web content extraction (e.g., headless browsers or HTML scraping) are performed.
         *   The result is a concise, synthesized research context passed forward as-is; there is no separate RAG pipeline.
 
-    *   **2.4.3 Phase 3: Initial Forecast & Simulated Peer Review:** The integrated research context is used to create the first forecast prompt (e.g., `BINARY_PROMPT_1`). Each agent generates an independent initial forecast. The critical step occurs in `Bot/binary.py`'s `context_map`, which swaps analyses between agents to simulate peer review across model families, encouraging a more robust synthesis of information.
+    *   **2.4.3 Phase 3: Initial Forecast & Simulated Peer Review:** The integrated research context is used to create the first forecast prompts. Each agent generates an independent initial forecast. The critical step is the rotation (`context_map`) of analyses between agents to simulate peer review and encourage robust synthesis.
 
-    *   **2.4.4 Phase 4: Final Synthesis & Prediction:** The final context is assembled by combining the integrated research (Phase 2) with the peer-reviewed initial forecast (Phase 3). This is fed into the final prompt (e.g., `BINARY_PROMPT_2`), and each agent produces its refined forecast.
+    *   **2.4.4 Phase 4: Final Synthesis & Prediction:** The final context combines integrated research with a peer analysis from a different agent; each agent produces a refined forecast.
 
 *   **2.5 Ensemble & Aggregation:**
-    *   **2.5.1 Statistical Method:** Individual forecasts are aggregated using a weighted average. In files like `Bot/binary.py`, this is implemented using `numpy.sum` on the weighted probabilities, divided by the sum of the weights. This combines the five distinct predictions into a single, calibrated forecast.
+    *   **2.5.1 Statistical Method:** Individual forecasts are aggregated using a weighted average. In files like `bot/binary.py`, this is implemented using `numpy.sum` on the weighted probabilities, divided by the sum of the weights. By default, three agent predictions are combined, but the committee size is configurable.
 
-    *   **2.5.2 Risk Management:** The final aggregated probability is explicitly clamped to a safe range, such as [0.001, 0.999] in `Bot/binary.py`. This is a critical risk management step that prevents the bot from making overly confident (0% or 100%) predictions, which are heavily penalized in most scoring systems if they are wrong.
+    *   **2.5.2 Risk Management & Calibration:** Binary probabilities are clipped to [0.001, 0.999] as a risk management safeguard against extreme confidence. Multiple-choice probabilities are normalized per-agent before aggregation. Numeric distributions are aggregated at the CDF level. No additional calibration transform is applied by default beyond these safeguards.
 
-*   **2.6 Output Generation & Submission:** The final steps are handled in `Bot/main.py`. The `create_forecast_payload` function formats the aggregated forecast into the specific JSON structure required by the Metaculus API for the given question type. The `post_question_prediction` function then submits this payload. In parallel, the combined reasoning from all agents is summarized by a final LLM call, and this concise explanation is posted as a private comment on the question page via `post_question_comment`.
+*   **2.6 Output Generation & Submission:** When running the committee engine, `CommitteeForecastBot` (in `bot/adapter.py`) returns `ReasonedPrediction` objects to the `forecasting_tools` framework, which handles converting forecasts into the correct Metaculus payloads and posting them. The adapter logs research and forecast summaries for traceability; comments are posted via `forecasting_tools` as configured.
 
 *   **2.7 End-to-End Forecasting Flow (Summary):**
     *   **Ingest Question:** Fetch open questions and skip those already forecasted.
-    *   **Route by Type:** Dispatch to `binary`, `multiple_choice`, or `numeric` pipelines.
-    *   **Dual-Perspective Scoping:** Run `_historical` (outside view) and `_current` (inside view) prompts in parallel to produce targeted queries.
-    *   **Integrated Research:** Use AskNews and Gemini 2.5 Flash `google_search` to gather and summarize recent, forecasting-relevant context (no RAG, scraping, or agentic browsing).
-    *   **Initial Forecast (Committee):** Provide the research pack to `*_PROMPT_1` and run concurrently across the heterogeneous model committee for independent estimates.
+    *   **Route by Type:** Dispatch to `binary`, `multiple_choice`, or `numeric` pipelines in `bot/`.
+    *   **Dual-Perspective Scoping:** Run the historical (outside view) and current (inside view) scoping prompts in parallel to produce targeted queries.
+    *   **Integrated Research:** Use AskNews and Gemini 2.5 Flash `google_search` (plus optional GPT‑4o Search) to gather and summarize recent, forecasting‑relevant context (no RAG, scraping, or agentic browsing).
+    *   **Initial Forecast (Committee):** Provide the research pack to agents and run concurrently across the committee for independent estimates.
     *   **Simulated Peer Review:** Swap initial analyses between agents (`context_map`) so each agent sees another’s reasoning plus the research pack.
-    *   **Final Synthesis:** Run `*_PROMPT_2` with research + peer-reviewed context to get refined forecasts from all agents.
-    *   **Ensemble Aggregation:** Extract structured outputs, apply per-agent weights, aggregate, and apply calibration safeguards (e.g., clamping/normalization as appropriate).
+    *   **Final Synthesis:** Run final prompts with research + peer‑reviewed context to get refined forecasts from all agents.
+    *   **Ensemble Aggregation:** Extract structured outputs, apply per‑agent weights, aggregate, and apply safeguards (e.g., clipping/normalization as appropriate).
     *   **Submit Forecast:** Convert to Metaculus payload (binary probability, MC distribution, or numeric 201-point CDF) and post.
 
     *   **Shared Forecasting Mechanics:**

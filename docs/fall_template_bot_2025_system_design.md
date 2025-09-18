@@ -4,7 +4,7 @@
 *   **1.1 High-Level Overview:** This document outlines the technical architecture of a sophisticated probabilistic forecasting system designed to compete in Metaculus tournaments. The system employs a multi-agent, multi-step reasoning process to analyze forecasting questions, conduct comprehensive research, and generate statistically aggregated predictions. It is architected to handle binary, multiple-choice, and numeric question types through specialized, asynchronous workflows, leveraging a heterogeneous "committee" of Large Language Models (LLMs) to produce robust and well-calibrated forecasts.
 
 *   **1.2 Core Design Philosophy:** The system is built upon several key principles to maximize forecasting accuracy and robustness:
-    *   **Multi-Agent Systems:** Instead of relying on a single model, the system uses a "committee" of LLM agents. By default, three real models are used, and the set is configurable via environment variables. This approach introduces cognitive diversity and reduces the risk of idiosyncratic errors or biases from a single model.
+    *   **Multi-Agent Systems:** Instead of relying on a single model, the system uses a "committee" of LLM agents. The active committee is configurable (see `bot/llm_calls.py:default_agent_committee`) and, by default, includes a heterogeneous set of real models across providers. You can override the set via environment variables. This approach introduces cognitive diversity and reduces the risk of idiosyncratic errors or biases from a single model.
     *   **Ensemble Methods:** Individual forecasts from each agent are combined using a weighted average (equal weights by default), a classic ensemble technique that leverages the strengths of different models to produce a more accurate and stable final prediction.
     *   **Prompt Chaining:** The forecasting process is broken down into a sequence of distinct, interconnected phases. Each phase's output serves as the input for the next, creating a structured workflow that guides the LLMs from scoped research to a final, synthesized prediction.
     *   **Up-to-Date Research:** The system's reasoning is grounded in current information gathered via AskNews and Gemini 2.5 Flash with the `google_search` tool, with an optional GPT‑4o Search (preview) integration via OpenRouter when configured. It does not perform general web content extraction or agentic browsing loops.
@@ -38,12 +38,14 @@
         5.  The final CDFs from all agents are aggregated using a weighted average.
 
 *   **2.3 The Multi-Agent "Committee" Model:**
-    *   **2.3.1 Agent Composition (Default):** By default, the committee uses three real models via OpenRouter:
+    *   **2.3.1 Agent Composition (Default):** By default, the committee uses real models across OpenRouter and Gemini. The current default list in `bot/llm_calls.py:default_agent_committee()` is:
         *   `openrouter/anthropic/claude-sonnet-4`
+        *   `openrouter/anthropic/claude-opus-4.1` (appears twice)
         *   `openrouter/openai/gpt-5`
-        *   `openrouter/anthropic/claude-opus-4.1`
-        These can be overridden by setting `COMMITTEE_LLM_MODELS` to a comma-separated list of model identifiers. Additional tuning env vars include `COMMITTEE_LLM_TEMPERATURE`, `COMMITTEE_LLM_TIMEOUT`, and `COMMITTEE_LLM_TRIES`.
-        Note: Gemini 2.5 is used in the research stack by default, not as a forecasting agent, but can be added via configuration if desired.
+        *   `openrouter/openai/o3-pro` (appears twice)
+        *   `gemini-2.5-flash`
+        *   `gemini-2.5-pro` (appears twice)
+        These can be overridden by setting `COMMITTEE_LLM_MODELS` to a comma-separated list of model identifiers. Additional tuning env vars include `COMMITTEE_LLM_TEMPERATURE`, `COMMITTEE_LLM_TIMEOUT`, and `COMMITTEE_LLM_TRIES`. Duplicates in the default list implicitly weight those models higher in the final aggregation (since all agents carry equal weight by default).
 
     *   **2.3.2 Rationale for Heterogeneity:** Mixing model families (e.g., Anthropic variants and OpenAI via OpenRouter) introduces cognitive diversity, helping to mitigate systematic reasoning flaws of any single model architecture. Teams can expand diversity further by adding additional providers/models via configuration.
 
@@ -64,7 +66,7 @@
     *   **2.4.4 Phase 4: Final Synthesis & Prediction:** The final context combines integrated research with a peer analysis from a different agent; each agent produces a refined forecast.
 
 *   **2.5 Ensemble & Aggregation:**
-    *   **2.5.1 Statistical Method:** Individual forecasts are aggregated using a weighted average. In files like `bot/binary.py`, this is implemented using `numpy.sum` on the weighted probabilities, divided by the sum of the weights. By default, three agent predictions are combined, but the committee size is configurable.
+    *   **2.5.1 Statistical Method:** Individual forecasts are aggregated using a weighted average. In files like `bot/binary.py`, this is implemented using `numpy.sum` on the weighted probabilities, divided by the sum of the weights. By default, all available agent predictions in the committee are combined (see 2.3.1 for the default models), and the committee size is configurable.
 
     *   **2.5.2 Risk Management & Calibration:** Binary probabilities are clipped to [0.001, 0.999] as a risk management safeguard against extreme confidence. Multiple-choice probabilities are normalized per-agent before aggregation. Numeric distributions are aggregated at the CDF level. No additional calibration transform is applied by default beyond these safeguards.
 
@@ -96,8 +98,8 @@
 
 ## 3.0 Key Modules & Technical Implementation Details
 *   **3.1 LLM Interaction (`Bot/llm_calls.py`):**
-    *   This layer abstracts LLM APIs, using GeneralLLM for OpenRouter models (`openrouter/claude-sonnet-4`, `openrouter/gpt-5`) and `genai.Client` for `gemini-2.5-pro`, decoupling forecasting logic from provider specifics.
-    *   It utilizes `asyncio` and `aiohttp` to manage concurrent API requests across agents, significantly speeding up end-to-end forecasting.
+    *   This layer abstracts LLM APIs, using `forecasting_tools.GeneralLlm` for OpenRouter/OpenAI-style models (e.g., `openrouter/anthropic/claude-sonnet-4`, `openrouter/openai/gpt-5`, `openrouter/openai/o3-pro`) and `google-genai` (`google.genai.Client`) for Gemini models (`gemini-2.5-flash`, `gemini-2.5-pro`), decoupling forecasting logic from provider specifics.
+    *   It utilizes `asyncio` for concurrent agent calls; Gemini calls are executed in a worker thread to avoid blocking the event loop.
     *   API calls implement exponential backoff for transient errors (e.g., 429/503), with bounded retries and jittered delays for resilience.
 
 *   **3.2 Research & News (`Bot/search.py`):**
@@ -119,6 +121,6 @@
 
 *   **4.2 Prompt Breakdown by Phase:** For the binary workflow, the prompts form a logical chain, guiding the LLMs from research to prediction.
     *   **`_historical` and `_current`:** These initial prompts are for research direction. They do not ask for a prediction. Instead, they ask the LLM to think about the question from an "outside view" (historical) and an "inside view" (current events) and to generate a list of search queries appropriate for each perspective.
-    *   **`assistant_prompt`:** Used to summarize outputs from AskNews and Gemini 2.5 Flash `google_search`, focusing only on forecasting-relevant information. No raw HTML extraction is performed.
-    *   **`_1` (e.g., `BINARY_PROMPT_1`):** This is the first forecasting prompt. It provides the LLM with the integrated research context and asks for an initial analysis and prediction. This serves as the "outside view" or base-rate forecast.
-    *   **`_2` (e.g., `BINARY_PROMPT_2`):** This is the final synthesis prompt. It provides the LLM with the integrated research context and the peer-reviewed analysis from another agent's output on `PROMPT_1`. It asks the LLM to integrate these sources of information to produce its final, most considered forecast.
+    *   **Integrated research context:** The outputs from AskNews (single combined query), Gemini 2.5 Flash `google_search`, and optional GPT‑4o Search are assembled by `bot/search.py:integrated_research` into a single text context. No web scraping or agentic browsing loops are performed.
+    *   **`_1` (initial forecast):** The first forecasting prompt provides the research context and asks each agent for an initial analysis. Agent wrappers enforce strict, parseable output only in the final phase.
+    *   **`_2` (final synthesis):** The final prompt provides the research context and a rotated peer analysis from another agent’s initial output, and each agent returns the final, strictly formatted forecast (e.g., `Probability: ZZ%`).

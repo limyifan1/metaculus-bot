@@ -162,8 +162,13 @@ class CommitteeForecastBot(ForecastBot):
         # Map the quantile path (values at evenly spaced probabilities) to declared percentiles
         # used by forecasting_tools. Grid is 0..1 with 201 points => index = int(round(p * 200)).
         sample_ps = [0.10, 0.20, 0.40, 0.60, 0.80, 0.90]
+        # Percentile objects expect integer percent values (e.g., 10, 20, ..., 90),
+        # while we index into the 201-point quantile path using decimal probabilities.
         declared = [
-            Percentile(percentile=p, value=float(quantile_values[int(round(p * 200))]))
+            Percentile(
+                percentile=int(round(p * 100)),
+                value=float(quantile_values[int(round(p * 200))]),
+            )
             for p in sample_ps
         ]
         distribution = NumericDistribution.from_question(declared, question)

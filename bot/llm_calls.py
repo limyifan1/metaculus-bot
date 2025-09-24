@@ -446,8 +446,8 @@ def default_agent_committee() -> List[LLMAgent]:
         "gemini-2.5-flash",
         "gemini-2.5-pro",
         "gemini-2.5-pro",
-        "openai/o3",
-        "openai/gpt-4o-mini",
+        "openai/gpt-5",
+        "openai/gpt-o4-mini",
     ]
     committee = [
         RealLLMAgent(

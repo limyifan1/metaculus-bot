@@ -444,8 +444,8 @@ def default_agent_committee() -> List[LLMAgent]:
     # Default REAL models when env override is not set
     default_models = [
         "gemini-2.5-flash",
-        "gemini-2.5-pro",
         "openai/gpt-5",
+        "gemini-2.5-pro",
         "openai/gpt-o4-mini",
     ]
     committee = [

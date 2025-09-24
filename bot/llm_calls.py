@@ -33,6 +33,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class LLMInvocationError(RuntimeError):
+    """Raised when a real LLM call exhausts all retries without success."""
+
+    def __init__(self, agent_name: str, mode: str, last_error: Exception | None):
+        details = f"Agent '{agent_name}' failed to generate output for mode '{mode}'"
+        if last_error is not None:
+            details = f"{details}. Last error: {last_error}"
+        super().__init__(details)
+
+
 @dataclass
 class LLMAgent:
     """Simple deterministic agent used for simulation.
@@ -364,15 +374,13 @@ class RealLLMAgent(LLMAgent):
                 else:
                     break
 
-        # Final fallback: deterministic generation to avoid bubbling exceptions
         logger.error(
-            "[Committee][Agent] %s REAL call exhausted retries (mode=%s). Falling back to deterministic output. Last error: %s",
+            "[Committee][Agent] %s REAL call exhausted retries (mode=%s). Last error: %s",
             self.name,
             mode,
             last_error,
         )
-        fallback_agent = LLMAgent(name=self.name, weight=self.weight)
-        return await fallback_agent.generate(prompt, mode, **kwargs)
+        raise LLMInvocationError(self.name, mode, last_error) from last_error
 
 
 def default_agent_committee() -> List[LLMAgent]:
@@ -435,13 +443,11 @@ def default_agent_committee() -> List[LLMAgent]:
 
     # Default REAL models when env override is not set
     default_models = [
-        "openrouter/anthropic/claude-sonnet-4",
-        "openrouter/anthropic/claude-opus-4.1",
-        "openrouter/openai/gpt-5",
-        "openrouter/openai/o3-pro",
         "gemini-2.5-flash",
         "gemini-2.5-pro",
         "gemini-2.5-pro",
+        "openai/o3",
+        "openai/gpt-4o-mini",
     ]
     committee = [
         RealLLMAgent(

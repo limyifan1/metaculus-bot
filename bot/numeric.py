@@ -45,8 +45,24 @@ async def get_numeric_forecast(
             topic=question,
         )
     )
-    hist = await hist_task
-    curr = await curr_task
+    try:
+        hist = await hist_task
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "[Committee][Numeric] Scoping (historical) failed for agent %s: %s",
+            scope_agent.name,
+            e,
+        )
+        hist = ""
+    try:
+        curr = await curr_task
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "[Committee][Numeric] Scoping (current) failed for agent %s: %s",
+            scope_agent.name,
+            e,
+        )
+        curr = ""
     queries = hist.splitlines() + curr.splitlines()
     logger.info("[Committee][Numeric] Scoped %s queries", len(queries))
     logger.debug("[Committee][Numeric] Scoped queries: %s", queries)
@@ -57,7 +73,7 @@ async def get_numeric_forecast(
 
     prompt1 = f"Date: {today} (UTC)\nResearch:\n{research_context}\nQuestion: {question}"
     logger.debug("[Committee][Numeric] Initial prompt:\n%s", prompt1)
-    initial = await asyncio.gather(
+    initial_results = await asyncio.gather(
         *[
             agent.generate(
                 prompt1,
@@ -66,12 +82,37 @@ async def get_numeric_forecast(
                 phase="initial",
             )
             for agent in agents
-        ]
+        ],
+        return_exceptions=True,
     )
-    logger.info("[Committee][Numeric] Initial responses collected: %s", len(initial))
-    logger.debug("[Committee][Numeric] Initial responses: %s", initial)
-    context_map = initial[1:] + initial[:1]
-    final = await asyncio.gather(
+    active_agents: List[LLMAgent] = []
+    initial_responses: List[str] = []
+    for agent, result in zip(agents, initial_results):
+        if isinstance(result, Exception):
+            logger.warning(
+                "[Committee][Numeric] Initial generation failed for agent %s: %s",
+                agent.name,
+                result,
+            )
+            continue
+        active_agents.append(agent)
+        initial_responses.append(result)
+    logger.info(
+        "[Committee][Numeric] Initial responses collected: %s (failed=%s)",
+        len(initial_responses),
+        len(agents) - len(initial_responses),
+    )
+    logger.debug("[Committee][Numeric] Initial responses: %s", initial_responses)
+
+    if not active_agents:
+        logger.error(
+            "[Committee][Numeric] All agents failed during initial generation. Returning baseline CDF."
+        )
+        return np.linspace(0.0, 1.0, 201).tolist()
+
+    context_map = initial_responses[1:] + initial_responses[:1]
+    logger.debug("[Committee][Numeric] Peer context map: %s", context_map)
+    final_results = await asyncio.gather(
         *[
             agent.generate(
                 f"Date: {today} (UTC)\nResearch:\n{research_context}\nPeer analysis:\n{peer}\nQuestion: {question}",
@@ -79,24 +120,69 @@ async def get_numeric_forecast(
                 percentiles=percentiles,
                 phase="final",
             )
-            for agent, peer in zip(agents, context_map)
-        ]
+            for agent, peer in zip(active_agents, context_map)
+        ],
+        return_exceptions=True,
     )
-    logger.info("[Committee][Numeric] Final responses collected: %s", len(final))
-    logger.debug("[Committee][Numeric] Final responses: %s", final)
+    final_agents: List[LLMAgent] = []
+    final_responses: List[str] = []
+    for agent, result in zip(active_agents, final_results):
+        if isinstance(result, Exception):
+            logger.warning(
+                "[Committee][Numeric] Final generation failed for agent %s: %s",
+                agent.name,
+                result,
+            )
+            continue
+        final_agents.append(agent)
+        final_responses.append(result)
+    logger.info(
+        "[Committee][Numeric] Final responses collected: %s (failed=%s)",
+        len(final_responses),
+        len(active_agents) - len(final_responses),
+    )
+    logger.debug("[Committee][Numeric] Final responses: %s", final_responses)
 
     cdfs: List[List[float]] = []
-    for resp in final:
+    filtered_agents: List[LLMAgent] = []
+    for agent, resp in zip(final_agents, final_responses):
         percentile_values: Dict[int, float] = extract_percentiles_from_response(resp)
         logger.debug(
             "[Committee][Numeric] Extracted percentiles from response: %s",
             percentile_values,
         )
-        forecast = PercentileForecast(percentile_values)
-        cdfs.append(forecast.generate_continuous_cdf())
+        if not percentile_values:
+            logger.warning(
+                "[Committee][Numeric] Skipping agent %s due to missing percentiles",
+                agent.name,
+            )
+            continue
+        try:
+            forecast = PercentileForecast(percentile_values)
+            cdfs.append(forecast.generate_continuous_cdf())
+            filtered_agents.append(agent)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[Committee][Numeric] Skipping agent %s due to CDF generation error: %s",
+                agent.name,
+                e,
+            )
 
-    weights = np.array([a.weight for a in agents])[:, None]
-    cdf_array = np.sum(weights * np.array(cdfs), axis=0) / np.sum(weights)
+    if not cdfs:
+        logger.error(
+            "[Committee][Numeric] No valid final responses remaining. Returning baseline CDF."
+        )
+        return np.linspace(0.0, 1.0, 201).tolist()
+
+    weights = np.array([a.weight for a in filtered_agents])[:, None]
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0:
+        logger.error(
+            "[Committee][Numeric] Non-positive weight sum after filtering. Returning baseline CDF."
+        )
+        return np.linspace(0.0, 1.0, 201).tolist()
+
+    cdf_array = np.sum(weights * np.array(cdfs), axis=0) / weight_sum
     logger.info(
         "[Committee][Numeric] Aggregated CDF size: %s (first/last: %.3f, %.3f)",
         len(cdf_array),

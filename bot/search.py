@@ -203,7 +203,7 @@ async def _gpt4o_search_preview(query: str) -> str:
     last_error: Exception | None = None
     while attempt <= max_retries:
         llm = GeneralLlm(
-            model="openrouter/openai/gpt-4o-search-preview",
+            model="openai/gpt-4o-search-preview",
             temperature=None,
             timeout=40,
             allowed_tries=2,
@@ -234,9 +234,8 @@ async def _gpt4o_search_preview(query: str) -> str:
                 await asyncio.sleep(delay)
             continue
 
-    result = (
-        f"[Mock GPT-4o-Search] search result for '{query}'"
-        + (f" (error: {last_error})" if last_error else "")
+    result = f"[Mock GPT-4o-Search] search result for '{query}'" + (
+        f" (error: {last_error})" if last_error else ""
     )
     logger.warning(
         "[Committee][GPT-4o-Search] All retries failed. Using mock. Error: %s",

@@ -437,9 +437,7 @@ def default_agent_committee() -> List[LLMAgent]:
     default_models = [
         "openrouter/anthropic/claude-sonnet-4",
         "openrouter/anthropic/claude-opus-4.1",
-        "openrouter/anthropic/claude-opus-4.1",
         "openrouter/openai/gpt-5",
-        "openrouter/openai/o3-pro",
         "openrouter/openai/o3-pro",
         "gemini-2.5-flash",
         "gemini-2.5-pro",

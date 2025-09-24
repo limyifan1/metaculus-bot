@@ -445,7 +445,6 @@ def default_agent_committee() -> List[LLMAgent]:
     default_models = [
         "gemini-2.5-flash",
         "gemini-2.5-pro",
-        "gemini-2.5-pro",
         "openai/gpt-5",
         "openai/gpt-o4-mini",
     ]

@@ -17,6 +17,10 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+MIN_POSTABLE_PROB = 0.01  # Align with forecasting_tools Metaculus API client constraints
+MAX_POSTABLE_PROB = 0.99
+
+
 async def get_binary_forecast(question: str, agents: List[LLMAgent]) -> float:
     """Forecast a binary question using the multi-step, multi-agent workflow."""
     logger.info(
@@ -167,10 +171,12 @@ async def get_binary_forecast(question: str, agents: List[LLMAgent]) -> float:
         )
         return 0.5
     aggregate = float(np.sum(weights * np.array(probs)) / weight_sum)
-    clipped = max(0.001, min(0.999, aggregate))
+    clipped = max(MIN_POSTABLE_PROB, min(MAX_POSTABLE_PROB, aggregate))
     logger.info(
-        "[Committee][Binary] Aggregated (weighted) prob=%.4f | Clipped=%.4f",
+        "[Committee][Binary] Aggregated (weighted) prob=%.4f | Clipped=%.4f (bounds %.2f-%.2f)",
         aggregate,
         clipped,
+        MIN_POSTABLE_PROB,
+        MAX_POSTABLE_PROB,
     )
     return clipped

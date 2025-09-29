@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from typing import List, Sequence
 
+import numpy as np
+
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
@@ -159,6 +161,91 @@ class CommitteeForecastBot(ForecastBot):
         quantile_values = await get_numeric_forecast(
             question.question_text, guiding_percentiles, self._agents
         )
+        quantile_array = np.array(quantile_values, dtype=float)
+
+        lower_bound = (
+            question.nominal_lower_bound
+            if question.nominal_lower_bound is not None
+            else question.lower_bound
+        )
+        upper_bound = (
+            question.nominal_upper_bound
+            if question.nominal_upper_bound is not None
+            else question.upper_bound
+        )
+
+        finite_mask = np.isfinite(quantile_array)
+        if not finite_mask.all():
+            logger.warning(
+                "[Committee][Numeric] Non-finite values detected in quantile path; interpolating across valid points"
+            )
+            if finite_mask.any():
+                idx = np.arange(quantile_array.size)
+                quantile_array = np.interp(
+                    idx,
+                    idx[finite_mask],
+                    quantile_array[finite_mask],
+                )
+            else:
+                if lower_bound is not None and upper_bound is not None:
+                    quantile_array = np.linspace(
+                        float(lower_bound), float(upper_bound), question.cdf_size
+                    )
+                else:
+                    logger.error(
+                        "[Committee][Numeric] All quantile points invalid and bounds missing; using fallback 0-1 range"
+                    )
+                    quantile_array = np.linspace(0.0, 1.0, question.cdf_size)
+
+        if lower_bound is None or upper_bound is None:
+            logger.warning(
+                "[Committee][Numeric] Missing numeric bounds; skipping quantile clipping"
+            )
+            constrained_quantiles = quantile_array
+        else:
+            span = float(upper_bound - lower_bound)
+            if not np.isfinite(span) or span <= 0.0:
+                span = max(abs(float(upper_bound)) + abs(float(lower_bound)), 1.0)
+            buffer = min(max(span * 1e-3, 1e-6), span / 4.0)
+
+            min_allowed = float(lower_bound)
+            max_allowed = float(upper_bound)
+
+            if question.open_lower_bound:
+                min_allowed = min_allowed + buffer
+            if question.open_upper_bound:
+                max_allowed = max_allowed - buffer
+
+            if min_allowed >= max_allowed:
+                mid = (float(lower_bound) + float(upper_bound)) / 2.0
+                half_span = max(span * 0.25, 1e-3)
+                min_allowed = mid - half_span
+                max_allowed = mid + half_span
+
+            quantile_min = float(np.min(quantile_array))
+            quantile_max = float(np.max(quantile_array))
+            rescaled = quantile_array
+            if quantile_max > quantile_min:
+                if quantile_min < min_allowed or quantile_max > max_allowed:
+                    rescaled = min_allowed + (quantile_array - quantile_min) * (
+                        (max_allowed - min_allowed) / (quantile_max - quantile_min)
+                    )
+            else:
+                rescaled = np.full_like(quantile_array, np.clip(quantile_min, min_allowed, max_allowed))
+
+            clipped = np.clip(rescaled, min_allowed, max_allowed)
+            num_adjusted = int(np.count_nonzero(~np.isclose(clipped, quantile_array)))
+            if num_adjusted:
+                logger.warning(
+                    "[Committee][Numeric] Adjusted %s/%s quantile points to fit within question range %.4f-%.4f",
+                    num_adjusted,
+                    quantile_array.size,
+                    min_allowed,
+                    max_allowed,
+                )
+            constrained_quantiles = clipped
+
+        quantile_values = constrained_quantiles.tolist()
         # Map the quantile path (values at evenly spaced probabilities) to declared percentiles
         # used by forecasting_tools. Grid is 0..1 with 201 points => index = int(round(p * 200)).
         sample_ps = [0.10, 0.20, 0.40, 0.60, 0.80, 0.90]

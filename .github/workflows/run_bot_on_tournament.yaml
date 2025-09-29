@@ -54,3 +54,10 @@ jobs:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+      - name: Upload verbose logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verbose-logs-${{ github.run_id }}
+          path: logs/*.log
+          if-no-files-found: warn

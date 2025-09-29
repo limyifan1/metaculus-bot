@@ -18,27 +18,42 @@ if __name__ == "__main__":
     unique_suffix = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
     log_file_path = os.path.join(logs_dir, f"run_{unique_suffix}.log")
 
+    class _ProgressOnlyFilter(logging.Filter):
+        """Allow progress-tagged logs (or errors) through the console handler."""
+
+        def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+            return getattr(record, "is_progress", False) or record.levelno >= logging.ERROR
+
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
-    formatter = logging.Formatter(
+    verbose_formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # Console handler
+    # Console handler (progress-only)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
-    ch.setFormatter(formatter)
+    ch.addFilter(_ProgressOnlyFilter())
+    ch.setFormatter(logging.Formatter("%(message)s"))
 
-    # File handler
+    # File handler (full verbosity)
     fh = logging.FileHandler(log_file_path, encoding="utf-8")
     fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
+    fh.setFormatter(verbose_formatter)
 
     # Avoid duplicate handlers if re-run in same interpreter
     root_logger.handlers = []
     root_logger.addHandler(ch)
     root_logger.addHandler(fh)
+
+    progress_logger = logging.getLogger("progress")
+    progress_logger.propagate = True
+
+    def log_progress(message: str, *args: object) -> None:
+        """Emit a progress update that is visible in GitHub Actions output."""
+
+        progress_logger.info(message, *args, extra={"is_progress": True})
 
     logging.getLogger(__name__).info("Logging to file: %s", log_file_path)
 
@@ -70,6 +85,7 @@ if __name__ == "__main__":
         "metaculus_cup",
         "test_questions",
     ], "Invalid run mode"
+    log_progress("Step: Starting forecasting run (mode=%s, engine=%s)", run_mode, engine)
     if engine == "template":
         template_bot = FallTemplateBot2025(
             research_reports_per_question=1,
@@ -118,11 +134,15 @@ if __name__ == "__main__":
         )
 
     if run_mode == "tournament":
+        log_progress(
+            "Step: Forecasting current AI competition questions",
+        )
         seasonal_tournament_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True
             )
         )
+        log_progress("Step: Forecasting minibench questions")
         minibench_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True
@@ -130,6 +150,7 @@ if __name__ == "__main__":
         )
         forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
+        log_progress("Step: Forecasting Metaculus Cup questions")
         template_bot.skip_previously_forecasted_questions = False
         forecast_reports = asyncio.run(
             template_bot.forecast_on_tournament(
@@ -144,6 +165,7 @@ if __name__ == "__main__":
             # "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
             "https://www.metaculus.com/questions/11112/us-military-response-to-invasion-of-taiwan/"
         ]
+        log_progress("Step: Forecasting test questions (%s total)", len(EXAMPLE_QUESTIONS))
         template_bot.skip_previously_forecasted_questions = False
         questions = [
             MetaculusApi.get_question_by_url(question_url)
@@ -153,3 +175,27 @@ if __name__ == "__main__":
             template_bot.forecast_questions(questions, return_exceptions=True)
         )
     template_bot.log_report_summary(forecast_reports)
+    total_reports = len(forecast_reports) if forecast_reports is not None else 0
+
+    failures = 0
+    for report in forecast_reports or []:
+        if report is None:
+            failures += 1
+            continue
+        if isinstance(report, BaseException):
+            failures += 1
+            continue
+        if getattr(report, "exception", None):
+            failures += 1
+            continue
+
+    successes = total_reports - failures
+    log_progress(
+        "Summary: %s total forecasts (%s succeeded, %s failed)",
+        total_reports,
+        successes,
+        failures,
+    )
+    if failures:
+        log_progress("Summary: %s failures recorded; check verbose artifact for details", failures)
+    log_progress("Summary: Verbose log captured at %s", log_file_path)

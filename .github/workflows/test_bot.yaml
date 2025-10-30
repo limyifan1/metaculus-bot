@@ -1,7 +1,9 @@
 name: Test Bot
 
 on:
-  workflow_dispatch:
+  # workflow_dispatch:
+
+# Workflow disabled: triggers commented out so it cannot start automatically or manually.
 
 # Add concurrency group to prevent parallel runs
 concurrency:

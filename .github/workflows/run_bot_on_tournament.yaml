@@ -1,9 +1,11 @@
 name: Forecast on new AI tournament questions
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+  # workflow_dispatch:
+  # schedule:
+  #   - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+
+# Workflow disabled: triggers commented out so it cannot start automatically or manually.
 
 # Add concurrency group to prevent parallel runs
 concurrency:
